@@ -7,7 +7,6 @@ from typing import Optional
 import torch
 from torch.utils.data import Dataset
 import numpy as np
-import time
 
 import PIL.Image
 try:
@@ -118,13 +117,7 @@ class CustomDataset(Dataset):
             raise FileNotFoundError(f"Missing patches file for {dino_cls_rel}: {dino_patches_path}")
 
         cls = np.load(dino_cls_path, mmap_mode='r')          # [D]
-        t0 = time.perf_counter()
         patches = np.load(dino_patches_path, mmap_mode='r')  # [1+N,D] or [N,D] depending on your writer
-        t1 = time.perf_counter()
-        print(
-            f"[CustomDataset] patches load idx={idx} time={(t1 - t0)*1000:.2f} ms file={os.path.basename(dino_patches_path)} shape={getattr(patches, 'shape', None)}",
-            flush=True,
-        )
 
         # torchify
         return (
