@@ -7,8 +7,8 @@ from typing import Optional
 import torch
 from torch.utils.data import Dataset
 import numpy as np
+import time
 
-from PIL import Image
 import PIL.Image
 try:
     import pyspng
@@ -18,7 +18,7 @@ except ImportError:
 
 class CustomDataset(Dataset):
     """
-    Original dataset with optional DINOv3 tokens loading.
+    Dataset with optional DINOv3 tokens loading (NPY-only).
 
     Returns:
       if load_dinov3 == False:
@@ -32,12 +32,12 @@ class CustomDataset(Dataset):
         self,
         data_dir: str,
         load_dinov3: bool = True,
-        dinov3_subdir: Optional[str] = "dinov3-vit7b16",  # folder or zip extracted folder name
+        dinov3_subdir: Optional[str] = "dinov3-vit7b16",  # folder name or absolute path
     ):
         PIL.Image.init()
-        supported_ext = PIL.Image.EXTENSION.keys() | {'.npy', '.npz'}
+        supported_img_ext = set(PIL.Image.EXTENSION.keys()) | {'.npy'}  # allow .png/.jpg/... or .npy stubs
 
-        self.images_dir = os.path.join(data_dir, 'imagenet_256_vae')
+        self.images_dir = os.path.join(data_dir, 'images')
         self.features_dir = os.path.join(data_dir, 'vae-sd')
 
         self.load_dinov3 = load_dinov3
@@ -45,7 +45,7 @@ class CustomDataset(Dataset):
         if load_dinov3:
             self.dinov3_dir = os.path.join(data_dir, dinov3_subdir)
             if not os.path.isdir(self.dinov3_dir):
-                # allow pointing directly to the path (zip extracted or plain dir)
+                # allow passing the absolute path directly
                 self.dinov3_dir = dinov3_subdir
 
         # images
@@ -54,31 +54,31 @@ class CustomDataset(Dataset):
             for root, _dirs, files in os.walk(self.images_dir) for fname in files
         }
         self.image_fnames = sorted(
-            fname for fname in self._image_fnames if self._file_ext(fname) in supported_ext
+            fname for fname in self._image_fnames if self._file_ext(fname) in supported_img_ext
         )
 
-        # vae features
+        # VAE latents (.npy)
         self._feature_fnames = {
             os.path.relpath(os.path.join(root, fname), start=self.features_dir)
             for root, _dirs, files in os.walk(self.features_dir) for fname in files
         }
         self.feature_fnames = sorted(
-            fname for fname in self._feature_fnames if self._file_ext(fname) in supported_ext
+            fname for fname in self._feature_fnames if self._file_ext(fname) == '.npy'
         )
 
+        # DINOv3 tokens (.npy only): we index by *_cls.npy; patches path is derived
         if self.load_dinov3:
             self._dinov3_fnames = {
                 os.path.relpath(os.path.join(root, fname), start=self.dinov3_dir)
                 for root, _dirs, files in os.walk(self.dinov3_dir) for fname in files
             }
-            # only .npz from our encoder
             self.dinov3_fnames = sorted(
-                fname for fname in self._dinov3_fnames if self._file_ext(fname) in supported_ext and fname.endswith('.npz')
+                fname for fname in self._dinov3_fnames if fname.endswith('_cls.npy')
             )
         else:
             self.dinov3_fnames = None
 
-        # labels come from the VAE features' dataset.json (unchanged)
+        # Labels come from the VAE features' dataset.json
         meta = os.path.join(self.features_dir, 'dataset.json')
         if not os.path.exists(meta):
             raise FileNotFoundError(f"Missing labels file: {meta}")
@@ -91,49 +91,46 @@ class CustomDataset(Dataset):
 
         if self.load_dinov3:
             assert len(self.image_fnames) == len(self.dinov3_fnames), \
-                "DINOv3 count must match images count"
+                f"DINOv3 count must match images count, got {len(self.dinov3_fnames)}, expected {len(self.image_fnames)}"
         assert len(self.image_fnames) == len(self.feature_fnames), \
             "VAE/Images count mismatch"
 
-    def _file_ext(self, fname):
+    def _file_ext(self, fname: str) -> str:
         return os.path.splitext(fname)[1].lower()
 
     def __len__(self):
         return len(self.feature_fnames)
 
     def __getitem__(self, idx):
-        image_fname = self.image_fnames[idx]
         feature_fname = self.feature_fnames[idx]
-        image_ext = self._file_ext(image_fname)
 
-        # raw image -> CHW uint8
-        with open(os.path.join(self.images_dir, image_fname), 'rb') as f:
-            if image_ext == '.npy':
-                image = np.load(f)
-                image = image.reshape(-1, *image.shape[-2:])
-            elif image_ext == '.png' and pyspng is not None:
-                img = pyspng.load(f.read())  # HWC
-                image = img.reshape(*img.shape[:2], -1).transpose(2, 0, 1)
-            else:
-                img = np.array(PIL.Image.open(f).convert('RGB'))  # HWC
-                image = img.reshape(*img.shape[:2], -1).transpose(2, 0, 1)
-
-        vae_latents = np.load(os.path.join(self.features_dir, feature_fname))
+        # VAE latents (mean+std packed) — NPY mmap
+        vae_latents = np.load(os.path.join(self.features_dir, feature_fname), mmap_mode='r')
 
         label = torch.tensor(self.labels[idx])
 
-        if not self.load_dinov3:
-            return torch.from_numpy(image), torch.from_numpy(vae_latents), label
+        # DINOv3 cls + patches (both NPY). dataset.json (features) aligns by index.
+        dino_cls_rel = self.dinov3_fnames[idx]  # "..._cls.npy"
+        dino_cls_path = os.path.join(self.dinov3_dir, dino_cls_rel)
+        dino_patches_path = dino_cls_path.replace('_cls.npy', '_patches.npy')
 
-        dino_fname = self.dinov3_fnames[idx]
-        with np.load(os.path.join(self.dinov3_dir, dino_fname)) as z:
-            tokens = z['tokens']  # [1+N, D], tokens[0] is CLS
-            cls = z['cls']        # [D]
+        if not os.path.isfile(dino_patches_path):
+            raise FileNotFoundError(f"Missing patches file for {dino_cls_rel}: {dino_patches_path}")
+
+        cls = np.load(dino_cls_path, mmap_mode='r')          # [D]
+        t0 = time.perf_counter()
+        patches = np.load(dino_patches_path, mmap_mode='r')  # [1+N,D] or [N,D] depending on your writer
+        t1 = time.perf_counter()
+        print(
+            f"[CustomDataset] patches load idx={idx} time={(t1 - t0)*1000:.2f} ms file={os.path.basename(dino_patches_path)} shape={getattr(patches, 'shape', None)}",
+            flush=True,
+        )
+
         # torchify
         return (
-            torch.from_numpy(image),
+            torch.ones(1),  # placeholder for raw image
             torch.from_numpy(vae_latents),
             label,
-            torch.from_numpy(tokens),
+            torch.from_numpy(patches),
             torch.from_numpy(cls),
         )

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from collections import OrderedDict
 import json
+import time
 
 import numpy as np
 import torch
@@ -132,7 +133,7 @@ def main(args):
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
-        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)]
+        kwargs_handlers=[DistributedDataParallelKwargs()]
     )
 
     if accelerator.is_main_process:
@@ -227,7 +228,9 @@ def main(args):
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
+        prefetch_factor=8,
+        persistent_workers=True,
     )
     if accelerator.is_main_process:
         logger.info(f"Dataset contains {len(train_dataset):,} images ({args.data_dir})")
@@ -282,7 +285,7 @@ def main(args):
         raise RuntimeError("load_dinov3 must be True; received 3-element batch.")
     else:
         raise RuntimeError("Unexpected batch structure.")
-    assert gt_raw_images.shape[-1] == args.resolution, "Resolution mismatch with dataset images."
+    # assert gt_raw_images.shape[-1] == args.resolution, "Resolution mismatch with dataset images."
     gt_xs = gt_xs[:sample_batch_size]
     gt_xs = sample_posterior(gt_xs.to(device), latents_scale=latents_scale, latents_bias=latents_bias)
     ys = torch.randint(0, args.num_classes, size=(sample_batch_size,), device=device)
@@ -301,15 +304,22 @@ def main(args):
         
     for epoch in range(args.epochs):
         model.train()
+        # Timing accumulators (reset every epoch)
         for batch in train_dataloader:
+            iter_start_wall = time.perf_counter()
+            # --- Data loading time (time since end of previous iteration when last sync) ---
+            # NOTE: dataloader has already produced 'batch'; this measures the gap including data fetch overlap
+            # We'll capture previous iteration end via 'prev_iter_end'; initialize on first loop
+            if 'prev_iter_end' not in locals():
+                prev_iter_end = iter_start_wall
+            data_time = iter_start_wall - prev_iter_end
             if len(batch) == 3:
                 raise RuntimeError("Dataset must be called with load_dinov3=True returning tokens.")
             raw_image, x, y, dinov3_tokens, dinov3_cls = batch
-            raw_image = raw_image.to(device)
-            x = x.squeeze(1).to(device)  # VAE latents (mean+std packed)
-            y = y.to(device)
-            dinov3_tokens = dinov3_tokens.to(device)  # [B, 1+N, D]
-            dinov3_cls = dinov3_cls.to(device)        # [B, D]
+            x = x.squeeze(1).to(device, non_blocking=True)  # VAE latents (mean+std packed)
+            y = y.to(device, non_blocking=True)
+            dinov3_tokens = dinov3_tokens.to(device, non_blocking=True)  # [B, 1+N, D]
+            dinov3_cls = dinov3_cls.to(device, non_blocking=True)        # [B, D]
 
             if args.legacy:
                 drop_ids = torch.rand(y.shape[0], device=y.device) < args.cfg_prob
@@ -323,7 +333,15 @@ def main(args):
             cls_token = dinov3_cls
             zs = [torch.cat([cls_token.unsqueeze(1), dinov3_tokens], dim=1)]
 
+            # Micro-step accumulators for gradient accumulation
+            if 'acc_forward_time' not in locals():
+                acc_forward_time = 0.0
+                acc_backward_time = 0.0
+                acc_optim_time = 0.0
+                acc_ema_time = 0.0
+
             with accelerator.accumulate(model):
+                forward_start = time.perf_counter()
                 model_kwargs = dict(y=labels)
                 loss1, proj_loss1, time_input, noises, loss2 = loss_fn(
                     model, x, model_kwargs,
@@ -335,22 +353,37 @@ def main(args):
                 loss_mean_cls = loss2.mean() * args.cls
                 proj_loss_mean = proj_loss1.mean() * args.proj_coeff
                 loss = loss_mean + proj_loss_mean + loss_mean_cls
+                forward_end = time.perf_counter()
+                acc_forward_time += (forward_end - forward_start)
 
+                backward_start = time.perf_counter()
                 accelerator.backward(loss)
+                backward_end = time.perf_counter()
+                acc_backward_time += (backward_end - backward_start)
+
+                optim_start = time.perf_counter()
                 if accelerator.sync_gradients:
                     params_to_clip = model.parameters()
                     grad_norm = accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                optim_end = time.perf_counter()
+                acc_optim_time += (optim_end - optim_start)
 
+                ema_start = time.perf_counter()
                 if accelerator.sync_gradients:
                     update_ema(ema, model)
+                ema_end = time.perf_counter()
+                if accelerator.sync_gradients:
+                    acc_ema_time += (ema_end - ema_start)
             
             ### enter
             if accelerator.sync_gradients:
+                iter_compute_end = time.perf_counter()
                 progress_bar.update(1)
                 global_step += 1                
             if global_step % args.checkpointing_steps == 0 and global_step > 0:
+                ckpt_start = time.perf_counter()
                 if accelerator.is_main_process:
                     checkpoint = {
                         "model": model.module.state_dict(),
@@ -362,12 +395,17 @@ def main(args):
                     checkpoint_path = f"{checkpoint_dir}/{global_step:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
+                ckpt_end = time.perf_counter()
+                ckpt_time = ckpt_end - ckpt_start
+            else:
+                ckpt_time = 0.0
 
             # ------------------------------------------------------------
             # In-training sampling (EMA model) every args.sampling_steps
             # Log image grid to wandb every 20000 steps
             # ------------------------------------------------------------
             if (global_step % args.sampling_steps == 0) and global_step > 0:
+                sampling_start = time.perf_counter()
                 with torch.no_grad():
                     ema.eval()
                     # load VAE once
@@ -409,20 +447,43 @@ def main(args):
                         except Exception as e:
                             if accelerator.is_main_process:
                                 logger.warning(f"Sampling failed at step {global_step}: {e}")
+                sampling_end = time.perf_counter()
+                sampling_time = sampling_end - sampling_start
+            else:
+                sampling_time = 0.0
 
-            logs = {
-                "loss_final": accelerator.gather(loss).mean().detach().item(),
-                "loss_mean": accelerator.gather(loss_mean).mean().detach().item(),
-                "proj_loss": accelerator.gather(proj_loss_mean).mean().detach().item(),
-                "loss_mean_cls": accelerator.gather(loss_mean_cls).mean().detach().item(),
-                "grad_norm": accelerator.gather(grad_norm).mean().detach().item()
-            }
+            if accelerator.sync_gradients:
+                step_total_time = iter_compute_end - iter_start_wall
+                # Prepare & log timing metrics (seconds)
+                logs = {
+                    "loss_final": accelerator.gather(loss).mean().detach().item(),
+                    "loss_mean": accelerator.gather(loss_mean).mean().detach().item(),
+                    "proj_loss": accelerator.gather(proj_loss_mean).mean().detach().item(),
+                    "loss_mean_cls": accelerator.gather(loss_mean_cls).mean().detach().item(),
+                    "grad_norm": accelerator.gather(grad_norm).mean().detach().item(),
+                    # timing
+                    "time_data": data_time,
+                    "time_forward": acc_forward_time,
+                    "time_backward": acc_backward_time,
+                    "time_optim": acc_optim_time,
+                    "time_ema": acc_ema_time,
+                    "time_ckpt": ckpt_time,
+                    "time_sampling": sampling_time,
+                    "time_step_total": step_total_time,
+                }
+                # Reset accumulators after a synced step
+                acc_forward_time = acc_backward_time = acc_optim_time = acc_ema_time = 0.0
+                prev_iter_end = time.perf_counter()
+            else:
+                # If not syncing (in gradient accumulation), skip logging this micro-step
+                logs = {}
 
-            log_message = ", ".join(f"{key}: {value:.6f}" for key, value in logs.items())
-            logging.info(f"Step: {global_step}, Training Logs: {log_message}")
+            # log_message = ", ".join(f"{key}: {value:.6f}" for key, value in logs.items())
+            # logging.info(f"Step: {global_step}, Training Logs: {log_message}")
 
-            progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
+            if logs:
+                progress_bar.set_postfix(**{k: v for k, v in logs.items() if k.startswith('loss') or k.startswith('time_')})
+                accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
                 break
@@ -467,7 +528,7 @@ def parse_args(input_args=None):
 
     # optimization
     parser.add_argument("--epochs", type=int, default=1400)
-    parser.add_argument("--max-train-steps", type=int, default=1000000)
+    parser.add_argument("--max-train-steps", type=int, default=2400001)
     parser.add_argument("--checkpointing-steps", type=int, default=10000)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
@@ -487,14 +548,13 @@ def parse_args(input_args=None):
     parser.add_argument("--path-type", type=str, default="linear", choices=["linear", "cosine"])
     parser.add_argument("--prediction", type=str, default="v", choices=["v"]) # currently we only support v-prediction
     parser.add_argument("--cfg-prob", type=float, default=0.1)
-    parser.add_argument("--enc-type", type=str, default='dinov2-vit-b')
     parser.add_argument("--proj-coeff", type=float, default=0.5)
     parser.add_argument("--weighting", default="uniform", type=str, help="Max gradient norm.")
     parser.add_argument("--legacy", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--cls", type=float, default=0.03)
     # sampling specific
     parser.add_argument("--cfg-scale", type=float, default=4.0, help="Classifier-free guidance scale for in-training sampling.")
-    parser.add_argument("--cls-cfg-scale", type=float, default=1.5, help="CLS guidance scale (used inside sampler).")
+    parser.add_argument("--cls-cfg-scale", type=float, default=1.0, help="CLS guidance scale (used inside sampler).")
     parser.add_argument("--guidance-low", type=float, default=0.0)
     parser.add_argument("--guidance-high", type=float, default=1.0)
     parser.add_argument("--num-sample-steps", type=int, default=50, help="Diffusion sampling steps for in-training sampling.")

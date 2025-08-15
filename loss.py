@@ -95,7 +95,7 @@ class SILoss:
         for i, (z, z_tilde) in enumerate(zip(zs, zs_tilde)):
             for j, (z_j, z_tilde_j) in enumerate(zip(z, z_tilde)):
                 z_tilde_j = torch.nn.functional.normalize(z_tilde_j, dim=-1) 
-                z_j = torch.nn.functional.normalize(z_j, dim=-1) 
+                z_j = torch.nn.functional.normalize(z_j, dim=-1)
                 proj_loss += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
         proj_loss /= (len(zs) * bsz)
 

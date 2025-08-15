@@ -29,12 +29,14 @@ python dataset_tools.py encode --source=dataset/images \
 ```
 
 ```
-python dataset_tool.py encode-dinov3 \
+python3 preprocessing/dataset_tools.py encode-dinov3 \
   --source dataset/images \
   --dest   dataset/dinov3-vit7b16 \
   --model-name facebook/dinov3-vit7b16-pretrain-lvd1689m \
-  --gpus 8 --batch-size 50 --dtype float16 --no-resize
+  --gpus 8 --batch-size 200 --dtype float16 --compress none
 ```
+
+compress none is significantly faster, but will take like ~20% more storage iirc
 
 
 Here,`YOUR_DOWNLOAD_PATH` is the directory that you downloaded the dataset, and `TARGET_PATH` is the directory that you will save the preprocessed images and corresponding compressed latent vectors. This directory will be used for your experiment scripts. 
