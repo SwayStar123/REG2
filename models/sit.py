@@ -153,14 +153,17 @@ class FinalLayer(nn.Module):
     def forward(self, x, c, cls=None):
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
         x = modulate(self.norm_final(x), shift, scale)
-
         if cls is None:
             x = self.linear(x)
             return x, None
+        # Determine number of class tokens from provided cls tensor shape
+        if cls.dim() == 2:
+            K = 1
         else:
-            cls_token = self.linear_cls(x[:, 0]).unsqueeze(1)
-            x = self.linear(x[:, 1:])
-            return x, cls_token.squeeze(1)
+            K = cls.shape[1]
+        cls_tokens_out = self.linear_cls(x[:, :K])  # (B,K,cls_dim)
+        patch_tokens = self.linear(x[:, K:])        # (B,T,patch_size^2*out_channels)
+        return patch_tokens, cls_tokens_out
 
 
 class SiT(nn.Module):
@@ -286,17 +289,26 @@ class SiT(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
-
-        #cat with cls_token
-        x = self.x_embedder(x)   # (N, T, D), where T = H * W / patch_size ** 2
-        if cls_token is not None:
-            cls_token = self.cls_projectors2(cls_token)
-            cls_token = self.wg_norm(cls_token)
-            cls_token = cls_token.unsqueeze(1)  # [b, length, d]
-            x = torch.cat((cls_token, x), dim=1)
-            x = x + self.pos_embed
+        # Embed patches
+        x = self.x_embedder(x)   # (B, Tpatch, Dhidden)
+        if cls_token is None:
+            raise ValueError("cls_token must be provided (Tensor (B,D) / (B,K,D))")
+        if cls_token.dim() == 2:
+            cls_token = cls_token.unsqueeze(1)  # (B,1,Dcls)
+        # Project per class token
+        cls_proj = self.cls_projectors2(cls_token)  # (B,K,Dhidden)
+        cls_proj = self.wg_norm(cls_proj)
+        B, K, Dh = cls_proj.shape
+        x = torch.cat((cls_proj, x), dim=1)  # (B, K+Tpatch, Dhidden)
+        # Compose positional embedding (replicate single CLS embedding K times)
+        if K == 1:
+            pos_full = self.pos_embed
         else:
-            exit()
+            pos_full = torch.cat([
+                self.pos_embed[:, :1, :].expand(1, K, -1),
+                self.pos_embed[:, 1:, :]
+            ], dim=1)
+        x = x + pos_full
         N, T, D = x.shape
 
         # timestep and class embedding
@@ -308,11 +320,11 @@ class SiT(nn.Module):
             x = block(x, c)
             if (i + 1) == self.encoder_depth:
                 zs = [projector(x.reshape(-1, D)).reshape(N, T, -1) for projector in self.projectors]
-
-        x, cls_token = self.final_layer(x, c, cls=cls_token)
+    # Final layer & decoding
+        x, cls_tokens_out = self.final_layer(x, c, cls=cls_token)
         x = self.unpatchify(x)
 
-        return x, zs, cls_token
+        return x, zs, cls_tokens_out
 
 
 #################################################################################

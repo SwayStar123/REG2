@@ -3,3 +3,4 @@ dataset/
 exps
 __pycache__
 wandb
+data/

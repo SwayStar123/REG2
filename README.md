@@ -152,3 +152,21 @@ If you have any questions, please create an issue on this repository, contact at
 Our code is based on [REPA](https://github.com/sihyun-yu/REPA), along with [SiT](https://github.com/willisma/SiT), [DINOv2](https://github.com/facebookresearch/dinov2), [ADM](https://github.com/openai/guided-diffusion) and [U-ViT](https://github.com/baofff/U-ViT) repositories. We thank the authors for releasing their code. If you use our model and code, please consider citing these works as well.
 
 
+
+## Test dataloader
+
+Single gpu
+```bash
+python dataset.py --data-dir dataset/imagenet_shards \
+  --batch-size 512 --num-workers 8 --prefetch-factor 8 --pin-memory \
+  --sampler shardwindow --window-shards 16 --limit 1000
+```
+
+Multi gpu
+```bash
+torchrun --standalone --nproc_per_node=8 dataset.py \
+  --data-dir dataset/imagenet_shards \
+  --batch-size 256 --num-workers 8 --prefetch-factor 8 --pin-memory --persistent-workers \
+  --sampler shardwindow --window-shards 16 --limit 4000
+
+```

@@ -1,12 +1,12 @@
 import argparse
 import copy
 from copy import deepcopy
+from html import parser
 import logging
 import os
 from pathlib import Path
 from collections import OrderedDict
 import json
-import time
 
 import numpy as np
 import torch
@@ -14,6 +14,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
+from transformers import AutoImageProcessor, AutoModel
 
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.logging import get_logger
@@ -23,7 +24,7 @@ from models.sit import SiT_models
 from samplers import euler_maruyama_sampler
 from loss import SILoss
 
-from dataset import CustomDataset
+from dataset import CustomDataset, ShardWindowSampler
 # import wandb_utils
 import wandb
 from diffusers.models import AutoencoderKL
@@ -32,6 +33,36 @@ import math
 from torchvision.utils import make_grid
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from torchvision.transforms import Normalize
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+try:
+    torch.set_num_threads(1)
+except Exception:
+    pass
+
+def _worker_init_fn(_):
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    try:
+        import torch as _t
+        _t.set_num_threads(1)
+    except Exception:
+        pass
+
+def _warm_shards(ds, shard_ids):
+    """Open + touch first row of each selected shard to warm page cache."""
+    try:
+        for sid in shard_ids:
+            ds.vae_arr._ensure_open(sid)[0]             # VAE
+            if getattr(ds, "dino_cls", None) is not None:
+                ds.dino_cls._ensure_open(sid)[0]        # DINO cls
+                ds.dino_pat._ensure_open(sid)[0]        # DINO patches
+                if getattr(ds, "dino_regs", None) is not None:
+                    ds.dino_regs._ensure_open(sid)[0]   # DINO registers (optional)
+    except Exception:
+        # Be fail-soft: if internals ever change, training should still run.
+        pass
 
 logger = get_logger(__name__)
 
@@ -160,16 +191,112 @@ def main(args):
     latent_size = args.resolution // 8
 
     # ------------------------------------------------------------------
-    # Dataset with pre-computed DINOv3 tokens (no online encoding)
+    # Dataset setup: either use precomputed DINO features, or compute on-the-fly
     # ------------------------------------------------------------------
-    train_dataset = CustomDataset(args.data_dir, load_dinov3=True, dinov3_subdir="dinov3-vit7b16")
-    # Infer token embedding dim from a single sample
-    tmp = train_dataset[0]
-    if len(tmp) == 5:
-        _raw_img, _vae_latents, _lbl, tmp_tokens, _tmp_cls = tmp
+    if args.dino_otf:
+        # Need raw images & VAE latents only; we'll compute DINO per step.
+        train_dataset = CustomDataset(
+            args.data_dir,
+            load_dinov3=False,
+            dinov3_subdir=args.dinov3_subdir,
+            load_registers=False,
+            load_image=True,
+        )
     else:
-        raise RuntimeError("Dataset must be initialized with load_dinov3=True returning 5 elements.")
-    token_dim = tmp_tokens.shape[-1]
+        train_dataset = CustomDataset(
+            args.data_dir,
+            load_dinov3=True,
+            dinov3_subdir=args.dinov3_subdir,
+            load_registers=False,
+            load_image=False,
+        )
+
+    if args.sampler == "shardwindow":
+        sampler = ShardWindowSampler(
+            train_dataset,
+            window_shards=accelerator.num_processes * args.window_shards,
+            strategy='cover',
+            seed=args.seed,
+            ddp_rank=accelerator.process_index,
+            ddp_world=accelerator.num_processes,
+        )
+    else:
+        from torch.utils.data import DistributedSampler
+        sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=accelerator.num_processes,
+            rank=accelerator.process_index,
+            shuffle=True,
+            drop_last=True,
+        )
+
+    # Enlarge per-array mmap LRU to match the shard window (reduce reopen thrash)
+    try:
+        target_cache = sampler.window_shards if hasattr(sampler, "window_shards") else 8
+        for arr in [train_dataset.vae_arr,
+                    getattr(train_dataset, "dino_cls", None),
+                    getattr(train_dataset, "dino_pat", None),
+                    getattr(train_dataset, "dino_regs", None)]:
+            if arr is not None:
+                arr.cache = max(arr.cache, target_cache)
+    except Exception:
+        pass
+
+    # Warm the first epoch’s shard window (prime OS page cache)
+    if args.sampler == "shardwindow":
+        w = sampler.window_shards
+        cover = sampler._cover
+        start = (0 * w) % max(w, sampler.num_shards)
+        shard_ids = list(cover[start:start + w])
+        if len(shard_ids) < w:
+            shard_ids += list(cover[:(w - len(shard_ids))])
+        _warm_shards(train_dataset, shard_ids)
+
+
+    # DINO model / processor if on-the-fly
+    dino_model = None
+    dino_processor = None
+    if args.dino_otf:
+        if accelerator.is_main_process:
+            logger.info(f"Loading DINOv3 model on rank0: {args.dinov3_model} (dtype={args.dino_dtype})")
+        torch_dtype = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }[args.dino_dtype]
+        dino_processor = AutoImageProcessor.from_pretrained(args.dinov3_model)
+        dino_model = AutoModel.from_pretrained(args.dinov3_model, torch_dtype=torch_dtype).to(device)
+        dino_model.eval()
+        if accelerator.is_main_process:
+            logger.info("DINOv3 model loaded for on-the-fly encoding.")
+        # infer token dim by one forward
+        tmp = train_dataset[0]
+        if len(tmp) != 3:
+            raise RuntimeError("Unexpected dataset return for OTF mode; expected 3 elements (img, vae, label).")
+        sample_raw, sample_vae, sample_lab = tmp
+        # make a tiny batch
+        sample_raw_t = torch.from_numpy(sample_raw) if isinstance(sample_raw, np.ndarray) else sample_raw
+        if sample_raw_t.ndim == 3 and sample_raw_t.shape[0] in (1,3):
+            # channels-first -> convert to HWC for processor (expects PIL or numpy HWC)
+            sample_raw_np = sample_raw_t.permute(1,2,0).cpu().numpy()
+        elif sample_raw_t.ndim == 3 and sample_raw_t.shape[-1] in (1,3):
+            sample_raw_np = sample_raw_t.cpu().numpy()
+        else:
+            raise RuntimeError("Cannot parse raw image shape for DINO OTF inference.")
+        inputs = dino_processor(images=[sample_raw_np], return_tensors="pt").to(device)
+        with torch.no_grad():
+            outputs = dino_model(**inputs)
+        lhs = outputs.last_hidden_state  # [1, 1+R+N, D]
+        token_dim = lhs.shape[-1]
+    else:
+        # Infer token embedding dim from a single sample (precomputed mode)
+        tmp = train_dataset[0]
+        if len(tmp) == 5:
+            _raw_img, _vae_latents, _lbl, tmp_tokens, _tmp_cls = tmp
+            token_dim = tmp_tokens.shape[-1]
+        else:
+            raise RuntimeError(
+                f"Dataset must be initialized with load_dinov3=True returning 5 elements. Got {len(tmp)} elements.")
     z_dims = [token_dim]
     encoders = []  # kept for SILoss interface (unused)
     block_kwargs = {"fused_attn": args.fused_attn, "qk_norm": args.qk_norm}
@@ -225,15 +352,27 @@ def main(args):
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=local_batch_size,
-        shuffle=True,
+        sampler=sampler,
+        shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
-        drop_last=True,
-        prefetch_factor=8,
-        persistent_workers=True,
+        drop_last=False,
+        prefetch_factor=2,
+        persistent_workers=(args.num_workers > 0),
+        worker_init_fn=(_worker_init_fn if args.num_workers > 0 else None),
     )
     if accelerator.is_main_process:
         logger.info(f"Dataset contains {len(train_dataset):,} images ({args.data_dir})")
+    # In your training script, after creating the sampler, add:
+    if accelerator.is_main_process:
+        # Test the sampler length
+        sampler_len = len(train_dataloader)
+        print(f"DataLoader length: {sampler_len}")
+        if args.window_shards:
+            print(f"Window shards: {sampler.window_shards}")
+            print(f"Total shards: {sampler.num_shards}")
+            print(f"Sampler counts (first 10): {sampler.counts[:10]}")
+            print(f"DDP rank/world: {accelerator.process_index}/{accelerator.num_processes}")
     
     # Prepare models for training:
     update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
@@ -246,16 +385,17 @@ def main(args):
         ckpt_name = str(args.resume_step).zfill(7) +'.pt'
         ckpt = torch.load(
             f'{os.path.join(args.output_dir, args.exp_name)}/checkpoints/{ckpt_name}',
-            map_location='cpu',
+            map_location='cpu', weights_only=False,
             )
         model.load_state_dict(ckpt['model'])
         ema.load_state_dict(ckpt['ema'])
         optimizer.load_state_dict(ckpt['opt'])
         global_step = ckpt['steps']
 
-    model, optimizer, train_dataloader = accelerator.prepare(
-        model, optimizer, train_dataloader
-    )
+    # model, optimizer, train_dataloader = accelerator.prepare(
+    #     model, optimizer, train_dataloader
+    # )
+    model, optimizer = accelerator.prepare(model, optimizer)
 
     if accelerator.is_main_process:
         tracker_config = vars(copy.deepcopy(args))
@@ -279,12 +419,15 @@ def main(args):
     # Labels to condition the model with (feel free to change):
     sample_batch_size = 64 // accelerator.num_processes
     sample_batch = next(iter(train_dataloader))
-    if len(sample_batch) == 5:
-        gt_raw_images, gt_xs, _labels, _tokens, _cls = sample_batch
-    elif len(sample_batch) == 3:
-        raise RuntimeError("load_dinov3 must be True; received 3-element batch.")
+    if args.dino_otf:
+        if len(sample_batch) != 3:
+            raise RuntimeError("OTF DINO mode expects dataset to return 3 elements.")
+        gt_raw_images, gt_xs, _labels = sample_batch
     else:
-        raise RuntimeError("Unexpected batch structure.")
+        if len(sample_batch) == 5:
+            gt_raw_images, gt_xs, _labels, _tokens, _cls = sample_batch
+        else:
+            raise RuntimeError("Precomputed DINO mode expects 5-element batch.")
     # assert gt_raw_images.shape[-1] == args.resolution, "Resolution mismatch with dataset images."
     gt_xs = gt_xs[:sample_batch_size]
     gt_xs = sample_posterior(gt_xs.to(device), latents_scale=latents_scale, latents_bias=latents_bias)
@@ -294,7 +437,7 @@ def main(args):
     xT = torch.randn((n, 4, latent_size, latent_size), device=device)
     # cls latents (dimension inferred from token_dim / cls token size)
     cls_latent_dim = token_dim
-    cls_z = torch.randn(n, cls_latent_dim, device=device)
+    cls_z = torch.randn(n, 5, cls_latent_dim, device=device)
 
     # sampling directory & VAE placeholder
     if accelerator.is_main_process:
@@ -303,19 +446,36 @@ def main(args):
     vae = None  # lazily loaded
         
     for epoch in range(args.epochs):
+        if hasattr(train_dataloader.sampler, "set_epoch"):
+            train_dataloader.sampler.set_epoch(epoch)
         model.train()
-        # Timing accumulators (reset every epoch)
         for batch in train_dataloader:
-            iter_start_wall = time.perf_counter()
-            # --- Data loading time (time since end of previous iteration when last sync) ---
-            # NOTE: dataloader has already produced 'batch'; this measures the gap including data fetch overlap
-            # We'll capture previous iteration end via 'prev_iter_end'; initialize on first loop
-            if 'prev_iter_end' not in locals():
-                prev_iter_end = iter_start_wall
-            data_time = iter_start_wall - prev_iter_end
-            if len(batch) == 3:
-                raise RuntimeError("Dataset must be called with load_dinov3=True returning tokens.")
-            raw_image, x, y, dinov3_tokens, dinov3_cls = batch
+            if args.dino_otf:
+                if len(batch) != 3:
+                    raise RuntimeError("OTF DINO mode expects 3-element batch (img, vae, label).")
+                raw_image, x, y = batch
+                # raw_image: tensor (B, H, W, C) or (B, C, H, W)
+                if raw_image.ndim != 4:
+                    raise RuntimeError("Raw image batch has unexpected ndim.")
+                if raw_image.shape[1] in (1,3) and raw_image.shape[-1] not in (1,3):
+                    # channels-first -> convert to list of HWC numpy arrays
+                    imgs_np = raw_image.permute(0,2,3,1).cpu().numpy().astype(np.uint8)
+                elif raw_image.shape[-1] in (1,3):
+                    imgs_np = raw_image.cpu().numpy().astype(np.uint8)
+                else:
+                    raise RuntimeError("Cannot determine channel placement for raw images.")
+                inputs = dino_processor(images=list(imgs_np), return_tensors="pt", do_resize=False, do_center_crop=False).to(device)
+                with torch.no_grad():
+                    outputs = dino_model(**inputs)
+                lhs = outputs.last_hidden_state  # [B, 1+R+N, D]
+                R = dino_model.config.num_register_tokens
+                dinov3_cls = lhs[:,0:R,:]
+                # skip register tokens for now (consistent with precomputed path w/o registers)
+                dinov3_tokens = lhs[:,1+R:,:]
+            else:
+                if len(batch) != 5:
+                    raise RuntimeError("Precomputed DINO mode expects 5-element batch.")
+                raw_image, x, y, dinov3_tokens, dinov3_cls = batch
             x = x.squeeze(1).to(device, non_blocking=True)  # VAE latents (mean+std packed)
             y = y.to(device, non_blocking=True)
             dinov3_tokens = dinov3_tokens.to(device, non_blocking=True)  # [B, 1+N, D]
@@ -331,17 +491,12 @@ def main(args):
                 x = sample_posterior(x, latents_scale=latents_scale, latents_bias=latents_bias)
 
             cls_token = dinov3_cls
-            zs = [torch.cat([cls_token.unsqueeze(1), dinov3_tokens], dim=1)]
+            if cls_token.ndim == 2:
+                cls_token = cls_token.unsqueeze(1)  # (B, 1, D)
 
-            # Micro-step accumulators for gradient accumulation
-            if 'acc_forward_time' not in locals():
-                acc_forward_time = 0.0
-                acc_backward_time = 0.0
-                acc_optim_time = 0.0
-                acc_ema_time = 0.0
+            zs = [torch.cat([cls_token, dinov3_tokens], dim=1)]
 
             with accelerator.accumulate(model):
-                forward_start = time.perf_counter()
                 model_kwargs = dict(y=labels)
                 loss1, proj_loss1, time_input, noises, loss2 = loss_fn(
                     model, x, model_kwargs,
@@ -353,37 +508,20 @@ def main(args):
                 loss_mean_cls = loss2.mean() * args.cls
                 proj_loss_mean = proj_loss1.mean() * args.proj_coeff
                 loss = loss_mean + proj_loss_mean + loss_mean_cls
-                forward_end = time.perf_counter()
-                acc_forward_time += (forward_end - forward_start)
-
-                backward_start = time.perf_counter()
                 accelerator.backward(loss)
-                backward_end = time.perf_counter()
-                acc_backward_time += (backward_end - backward_start)
-
-                optim_start = time.perf_counter()
                 if accelerator.sync_gradients:
                     params_to_clip = model.parameters()
                     grad_norm = accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-                optim_end = time.perf_counter()
-                acc_optim_time += (optim_end - optim_start)
-
-                ema_start = time.perf_counter()
                 if accelerator.sync_gradients:
                     update_ema(ema, model)
-                ema_end = time.perf_counter()
-                if accelerator.sync_gradients:
-                    acc_ema_time += (ema_end - ema_start)
             
             ### enter
             if accelerator.sync_gradients:
-                iter_compute_end = time.perf_counter()
                 progress_bar.update(1)
                 global_step += 1                
             if global_step % args.checkpointing_steps == 0 and global_step > 0:
-                ckpt_start = time.perf_counter()
                 if accelerator.is_main_process:
                     checkpoint = {
                         "model": model.module.state_dict(),
@@ -395,17 +533,12 @@ def main(args):
                     checkpoint_path = f"{checkpoint_dir}/{global_step:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
-                ckpt_end = time.perf_counter()
-                ckpt_time = ckpt_end - ckpt_start
-            else:
-                ckpt_time = 0.0
 
             # ------------------------------------------------------------
             # In-training sampling (EMA model) every args.sampling_steps
             # Log image grid to wandb every 20000 steps
             # ------------------------------------------------------------
             if (global_step % args.sampling_steps == 0) and global_step > 0:
-                sampling_start = time.perf_counter()
                 with torch.no_grad():
                     ema.eval()
                     # load VAE once
@@ -430,59 +563,38 @@ def main(args):
                             cls_latents=cls_z.clone(),
                             args=args,
                         )
-                        try:
-                            samples = euler_maruyama_sampler(**sampling_kwargs).to(torch.float32)
-                            # decode to pixels
-                            samples = vae.decode((samples - latents_bias) / latents_scale).sample
-                            samples = (samples + 1) / 2.
-                            samples = samples.clamp(0, 1)
-                            accelerator.wait_for_everyone()
-                            gathered = accelerator.gather(samples)
-                            if accelerator.is_main_process:
-                                grid = array2grid(gathered)
-                                Image.fromarray(grid).save(f"{sample_dir}/samples_step_{global_step}.png")
-                                logger.info(f"Saved samples at step {global_step}")
-                                if global_step % 20000 == 0:
-                                    accelerator.log({"samples": wandb.Image(grid)}, step=global_step)
-                        except Exception as e:
-                            if accelerator.is_main_process:
-                                logger.warning(f"Sampling failed at step {global_step}: {e}")
-                sampling_end = time.perf_counter()
-                sampling_time = sampling_end - sampling_start
-            else:
-                sampling_time = 0.0
+
+                        samples = euler_maruyama_sampler(**sampling_kwargs).to(torch.float32)
+                        # decode to pixels
+                        samples = vae.decode((samples - latents_bias) / latents_scale).sample
+                        samples = (samples + 1) / 2.
+                        samples = samples.clamp(0, 1)
+                        accelerator.wait_for_everyone()
+                        gathered = accelerator.gather(samples)
+                        if accelerator.is_main_process:
+                            grid = array2grid(gathered)
+                            Image.fromarray(grid).save(f"{sample_dir}/samples_step_{global_step}.png")
+                            logger.info(f"Saved samples at step {global_step}")
+                            if global_step % 20000 == 0:
+                                accelerator.log({"samples": wandb.Image(grid)}, step=global_step)
+
 
             if accelerator.sync_gradients:
-                step_total_time = iter_compute_end - iter_start_wall
-                # Prepare & log timing metrics (seconds)
                 logs = {
                     "loss_final": accelerator.gather(loss).mean().detach().item(),
                     "loss_mean": accelerator.gather(loss_mean).mean().detach().item(),
                     "proj_loss": accelerator.gather(proj_loss_mean).mean().detach().item(),
                     "loss_mean_cls": accelerator.gather(loss_mean_cls).mean().detach().item(),
                     "grad_norm": accelerator.gather(grad_norm).mean().detach().item(),
-                    # timing
-                    "time_data": data_time,
-                    "time_forward": acc_forward_time,
-                    "time_backward": acc_backward_time,
-                    "time_optim": acc_optim_time,
-                    "time_ema": acc_ema_time,
-                    "time_ckpt": ckpt_time,
-                    "time_sampling": sampling_time,
-                    "time_step_total": step_total_time,
                 }
-                # Reset accumulators after a synced step
-                acc_forward_time = acc_backward_time = acc_optim_time = acc_ema_time = 0.0
-                prev_iter_end = time.perf_counter()
             else:
-                # If not syncing (in gradient accumulation), skip logging this micro-step
                 logs = {}
 
             # log_message = ", ".join(f"{key}: {value:.6f}" for key, value in logs.items())
             # logging.info(f"Step: {global_step}, Training Logs: {log_message}")
 
             if logs:
-                progress_bar.set_postfix(**{k: v for k, v in logs.items() if k.startswith('loss') or k.startswith('time_')})
+                progress_bar.set_postfix(**{k: v for k, v in logs.items() if k.startswith('loss')})
                 accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
@@ -518,6 +630,9 @@ def parse_args(input_args=None):
     parser.add_argument("--ops-head", type=int, default=16)
 
     # dataset
+    # add to argparse (near dataset args)
+    parser.add_argument("--window-shards", type=int, default=8)
+    parser.add_argument("--sampler", type=str, choices=["distributed","shardwindow"], default="shardwindow")
     parser.add_argument("--data-dir", type=str, default="../dataset")
     parser.add_argument("--resolution", type=int, choices=[256, 512], default=256)
     parser.add_argument("--batch-size", type=int, default=8)#256
@@ -527,7 +642,7 @@ def parse_args(input_args=None):
     parser.add_argument("--mixed-precision", type=str, default="fp16", choices=["no", "fp16", "bf16"])
 
     # optimization
-    parser.add_argument("--epochs", type=int, default=1400)
+    parser.add_argument("--epochs", type=int, default=1000000)
     parser.add_argument("--max-train-steps", type=int, default=2400001)
     parser.add_argument("--checkpointing-steps", type=int, default=10000)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
@@ -559,6 +674,11 @@ def parse_args(input_args=None):
     parser.add_argument("--guidance-high", type=float, default=1.0)
     parser.add_argument("--num-sample-steps", type=int, default=50, help="Diffusion sampling steps for in-training sampling.")
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="mse", help="Which Stable Diffusion VAE variant to use for decoding samples.")
+    # DINO on-the-fly options
+    parser.add_argument("--dino-otf", action=argparse.BooleanOptionalAction, default=False, help="Compute DINOv3 embeddings on-the-fly instead of using precomputed shards.")
+    parser.add_argument("--dinov3-model", type=str, default="facebook/dinov3-vit7b16-pretrain-lvd1689m", help="DINOv3 HF model id for OTF mode.")
+    parser.add_argument("--dinov3-subdir", type=str, default="dinov3-vit7b16", help="Subdirectory name for precomputed DINO features (when not OTF).")
+    parser.add_argument("--dino-dtype", type=str, choices=["float32","float16","bfloat16"], default="float16")
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:

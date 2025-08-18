@@ -16,30 +16,43 @@ then use ```aria2c -x 16 -s 16 "link"``` to download quickly
 
 After downloading ImageNet, please run the following scripts (please update 256x256 to 512x512 if you want to do experiments on 512x512 resolution);
 
+Recommended:
 ```bash
-# Convert raw ImageNet data to a ZIP archive at 256x256 resolution
-python dataset_tools.py convert --source=data/ILSVRC/Data/CLS-LOC/train \
-    --dest=dataset/images --resolution=256x256 --transform=center-crop-dhariwal
+# 8 GPUs, 256x256, Dhariwal center-crop
+python3 preprocessing/dataset_tools.py all \
+  --source data/ILSVRC/Data/CLS-LOC/train \
+  --dest dataset \
+  --resolution 256x256 --transform center-crop-dhariwal \
+  --gpus 8 --batch-size 64 \
+  --vae-url stabilityai/sd-vae-ft-mse \
+  --dino-model facebook/dinov3-vit7b16-pretrain-lvd1689m \
+  --dino-dtype float16 --dino-dim 4096 --patch-size 16 --num-register 4 \
+  --workers 32
+
 ```
 
+Staged for whatever reason:
 ```bash
-# Convert the pixel data to VAE latents
-python dataset_tools.py encode --source=dataset/images \
-    --dest=dataset/vae-sd
-```
+# 1) Pack images
+python preprocessing/dataset_tools.py images \
+  --source /data/imagenet/ILSVRC/train \
+  --dest   /dataset/imagenet_shards \
+  --resolution 256x256 \
+  --transform center-crop-dhariwal \
+  --workers 48
 
-```
-python3 preprocessing/dataset_tools.py encode-dinov3 \
-  --source dataset/images \
-  --dest   dataset/dinov3-vit7b16 \
+# 2) Encode VAE
+python preprocessing/dataset_tools.py encode-vae \
+  --dataset-root /dataset/imagenet_shards \
+  --gpus 8 --batch-size 128
+
+# 3) Encode DINOv3
+python preprocessing/dataset_tools.py encode-dino \
+  --dataset-root /dataset/imagenet_shards \
+  --gpus 8 --batch-size 64 \
   --model-name facebook/dinov3-vit7b16-pretrain-lvd1689m \
-  --gpus 8 --batch-size 200 --dtype float16 --compress none
+  --dtype float16
 ```
-
-compress none is significantly faster, but will take like ~20% more storage iirc
-
-
-Here,`YOUR_DOWNLOAD_PATH` is the directory that you downloaded the dataset, and `TARGET_PATH` is the directory that you will save the preprocessed images and corresponding compressed latent vectors. This directory will be used for your experiment scripts. 
 
 ## Acknowledgement
 

@@ -15,8 +15,10 @@ accelerate launch --multi_gpu --num_processes $NUM_GPUS train.py \
     --encoder-depth=8 \
     --exp-name="xl-dinov3-7b" \
     --batch-size=256 \
-    --data-dir="dataset" \
-    --cls=0.03
+    --data-dir="dataset/" \
+    --cls=0.03 \
+    --resume-step 50000 \
+    --dino-otf
 
 
     #Dataset Path
