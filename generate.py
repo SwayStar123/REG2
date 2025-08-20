@@ -22,7 +22,6 @@ import numpy as np
 import math
 import argparse
 from samplers import euler_maruyama_sampler
-from utils import load_legacy_checkpoints, download_model
 
 
 def create_npz_from_sample_folder(sample_dir, num=50_000):
@@ -75,19 +74,7 @@ def main(args):
 
 
     #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    if ckpt_path is None:
-        args.ckpt = 'SiT-XL-2-256x256.pt'
-        assert args.model == 'SiT-XL/2'
-        assert len(args.projector_embed_dims.split(',')) == 1
-        assert int(args.projector_embed_dims.split(',')[0]) == 768
-        state_dict = download_model('last.pt')
-    else:
-        state_dict = torch.load(ckpt_path, map_location=f'cuda:{device}')['ema']
-
-    if args.legacy:
-        state_dict = load_legacy_checkpoints(
-            state_dict=state_dict, encoder_depth=args.encoder_depth
-            )
+    state_dict = torch.load(ckpt_path, map_location=f'cuda:{device}', weights_only=False)['ema']
     model.load_state_dict(state_dict)
     #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
@@ -128,7 +115,7 @@ def main(args):
         # Sample inputs:
         z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
         y = torch.randint(0, args.num_classes, (n,), device=device)
-        cls_z = torch.randn(n, args.cls, device=device)
+        cls_z = torch.randn(n, 5, args.cls, device=device)
 
         # Sample images:
         sampling_kwargs = dict(
@@ -211,14 +198,14 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, default="ode")
     parser.add_argument("--cfg-scale",  type=float, default=1.5)
     parser.add_argument("--cls-cfg-scale",  type=float, default=1.5)
-    parser.add_argument("--projector-embed-dims", type=str, default="768,1024")
+    parser.add_argument("--projector-embed-dims", type=str, default="4096")
     parser.add_argument("--path-type", type=str, default="linear", choices=["linear", "cosine"])
     parser.add_argument("--num-steps", type=int, default=50)
     parser.add_argument("--heun", action=argparse.BooleanOptionalAction, default=False) # only for ode
     parser.add_argument("--guidance-low", type=float, default=0.)
     parser.add_argument("--guidance-high", type=float, default=1.)
     parser.add_argument('--local-rank', default=-1, type=int)
-    parser.add_argument('--cls', default=768, type=int)
+    parser.add_argument('--cls', default=4096, type=int)
     # will be deprecated
     parser.add_argument("--legacy", action=argparse.BooleanOptionalAction, default=False) # only for ode
 

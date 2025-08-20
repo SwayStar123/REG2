@@ -4,3 +4,6 @@ exps
 __pycache__
 wandb
 data/
+evaluations/VIRTUAL_imagenet256_labeled.npz
+evaluations/eval
+classify_image_graph_def.pb
