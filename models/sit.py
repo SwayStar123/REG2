@@ -140,7 +140,7 @@ class FinalLayer(nn.Module):
     """
     The final layer of SiT.
     """
-    def __init__(self, hidden_size, patch_size, out_channels, cls_token_dim):
+    def __init__(self, hidden_size, patch_size, out_channels, cls_token_dim, cls_tokens):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
@@ -149,18 +149,18 @@ class FinalLayer(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, 2 * hidden_size, bias=True)
         )
+        self.cls_tokens = cls_tokens
 
     def forward(self, x, c, cls=None):
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
         x = modulate(self.norm_final(x), shift, scale)
 
         if cls is None:
-            x = self.linear(x)
-            return x, None
+            return self.linear(x), None
         else:
-            cls_token = self.linear_cls(x[:, 0]).unsqueeze(1)
-            x = self.linear(x[:, 1:])
-            return x, cls_token.squeeze(1)
+            cls_token = self.linear_cls(x[:, :self.cls_tokens])
+            x = self.linear(x[:, self.cls_tokens:])
+            return x, cls_token
 
 
 class SiT(nn.Module):
@@ -185,6 +185,7 @@ class SiT(nn.Module):
         z_dims=[4096],
         projector_dim=4096,
         cls_token_dim=4096,
+        cls_tokens=16,
         **block_kwargs # fused_attn
     ):
         super().__init__()
@@ -197,6 +198,7 @@ class SiT(nn.Module):
         self.num_classes = num_classes
         self.z_dims = z_dims
         self.encoder_depth = encoder_depth
+        self.cls_tokens = cls_tokens
 
         self.x_embedder = PatchEmbed(
             input_size, patch_size, in_channels, hidden_size, bias=True
@@ -205,7 +207,7 @@ class SiT(nn.Module):
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches+1, hidden_size), requires_grad=False)
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + cls_tokens, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
             SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, **block_kwargs) for _ in range(depth)
@@ -215,8 +217,8 @@ class SiT(nn.Module):
             ])
 
         z_dim = self.z_dims[0]
-        cls_token_dim = z_dim
-        self.final_layer = FinalLayer(decoder_hidden_size, patch_size, self.out_channels, cls_token_dim)
+        cls_token_dim = z_dim // cls_tokens  # Split the dimension among tokens
+        self.final_layer = FinalLayer(decoder_hidden_size, patch_size, self.out_channels, cls_token_dim, cls_tokens)
 
 
         self.cls_projectors2 = nn.Linear(in_features=cls_token_dim, out_features=hidden_size, bias=True)
@@ -234,8 +236,8 @@ class SiT(nn.Module):
         self.apply(_basic_init)
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
-        pos_embed = get_2d_sincos_pos_embed(
-            self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5), cls_token=1, extra_tokens=1
+        pos_embed = get_3d_sincos_pos_embed(
+            self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5), cls_tokens=self.cls_tokens
             )
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
@@ -285,6 +287,7 @@ class SiT(nn.Module):
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
+        cls_token: (N, cls_tokens, cls_token_dim) tensor of class tokens
         """
 
         #cat with cls_token
@@ -292,9 +295,11 @@ class SiT(nn.Module):
         if cls_token is not None:
             cls_token = self.cls_projectors2(cls_token)
             cls_token = self.wg_norm(cls_token)
-            cls_token = cls_token.unsqueeze(1)  # [b, length, d]
+            # cls_token = cls_token.unsqueeze(1)  # [b, length, d]
+            
             x = torch.cat((cls_token, x), dim=1)
             x = x + self.pos_embed
+            
         else:
             exit()
         N, T, D = x.shape
@@ -307,7 +312,7 @@ class SiT(nn.Module):
         for i, block in enumerate(self.blocks):
             x = block(x, c)
             if (i + 1) == self.encoder_depth:
-                zs = [projector(x.reshape(-1, D)).reshape(N, T, -1) for projector in self.projectors]
+                zs = [projector(x[:, cls_token.shape[1]:]) for projector in self.projectors]
 
         x, cls_token = self.final_layer(x, c, cls=cls_token)
         x = self.unpatchify(x)
@@ -335,6 +340,61 @@ def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=
     pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
     if cls_token and extra_tokens > 0:
         pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0)
+    return pos_embed
+
+
+def get_3d_sincos_pos_embed(embed_dim, grid_size, cls_tokens=0):
+    """
+    3D sinusoidal position embedding that combines 2D spatial embeddings with 
+    class token position embeddings.
+    
+    Args:
+        embed_dim: embedding dimension
+        grid_size: int of the grid height and width for spatial patches
+        cls_tokens: number of class tokens
+        
+    Returns:
+        pos_embed: [cls_tokens + grid_size*grid_size, embed_dim]
+    """
+    assert embed_dim % 3 == 0, "embed_dim must be divisible by 3 for 3D embeddings"
+    
+    # Allocate embedding dimensions: 1/3 each for height, width, and class token dimension
+    dim_per_axis = embed_dim // 3
+    
+    # Generate 2D spatial embeddings for patches
+    grid_h = np.arange(grid_size, dtype=np.float32)
+    grid_w = np.arange(grid_size, dtype=np.float32)
+    grid = np.meshgrid(grid_w, grid_h)  # w goes first
+    grid = np.stack(grid, axis=0)
+    grid = grid.reshape([2, 1, grid_size, grid_size])
+    
+    # Get spatial embeddings (height and width)
+    emb_h = get_1d_sincos_pos_embed_from_grid(dim_per_axis, grid[1])  # (H*W, D/3) - height
+    emb_w = get_1d_sincos_pos_embed_from_grid(dim_per_axis, grid[0])  # (H*W, D/3) - width
+    
+    # Create class token dimension embeddings for patches (all zeros since they're not class tokens)
+    spatial_cls_dim = np.zeros((grid_size * grid_size, dim_per_axis), dtype=np.float32)
+    
+    # Combine spatial embeddings
+    spatial_embed = np.concatenate([emb_h, emb_w, spatial_cls_dim], axis=1)  # (H*W, D)
+    
+    if cls_tokens > 0:
+        # Create class token embeddings
+        cls_positions = np.arange(cls_tokens, dtype=np.float32)
+        cls_dim_embed = get_1d_sincos_pos_embed_from_grid(dim_per_axis, cls_positions)  # (cls_tokens, D/3)
+        
+        # Class tokens have no spatial position, so use zeros for height and width dimensions
+        cls_spatial_h = np.zeros((cls_tokens, dim_per_axis), dtype=np.float32)
+        cls_spatial_w = np.zeros((cls_tokens, dim_per_axis), dtype=np.float32)
+        
+        # Combine class token embeddings
+        cls_embed = np.concatenate([cls_spatial_h, cls_spatial_w, cls_dim_embed], axis=1)  # (cls_tokens, D)
+        
+        # Concatenate class tokens first, then spatial patches
+        pos_embed = np.concatenate([cls_embed, spatial_embed], axis=0)
+    else:
+        pos_embed = spatial_embed
+    
     return pos_embed
 
 

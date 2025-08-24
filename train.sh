@@ -13,7 +13,7 @@ accelerate launch --multi_gpu --num_processes $NUM_GPUS train.py \
     --model="SiT-XL/2" \
     --proj-coeff=0.5 \
     --encoder-depth=8 \
-    --exp-name="xl-dinov3-7b" \
+    --exp-name="xl-dinov3-7b-16-clstoks" \
     --batch-size=256 \
     --data-dir="dataset" \
     --cls=0.03

@@ -23,7 +23,8 @@ import PIL.Image
 import torch
 from tqdm import tqdm
 
-from encoders import StabilityVAEEncoder
+# NOTE: Heavy encoder imports are deferred to worker functions so that lightweight
+# utilities (e.g., pack_npy_directory) can be used without full model deps.
 
 #----------------------------------------------------------------------------
 
@@ -261,7 +262,11 @@ def encode_image_worker(args):
     """Worker function for parallel VAE encoding."""
     gpu_id, batch_data, model_url = args
     device = torch.device(f'cuda:{gpu_id}')
-    
+    # Lazy import to avoid requiring encoders for unrelated utilities
+    try:
+        from encoders import StabilityVAEEncoder
+    except ModuleNotFoundError as e:
+        raise RuntimeError("StabilityVAEEncoder not available. Ensure PYTHONPATH includes project root or install encoders module.") from e
     vae = StabilityVAEEncoder(vae_name=model_url, batch_size=1)
     results = []
     
@@ -449,6 +454,8 @@ def convert(
 @click.option('--max-images', help='Maximum number of images to output', metavar='INT', type=int)
 @click.option('--gpus',       help='Number of GPUs to use for parallel encoding', metavar='INT', type=int, default=8, show_default=True)
 @click.option('--batch-size', help='Number of images per GPU in each batch', metavar='INT', type=int, default=100, show_default=True)
+@click.option('--pack-shards', is_flag=True, default=False, help='After encoding, pack individual .npy files into contiguous shards (creates vae_packed).')
+@click.option('--shard-size-gb', type=float, default=4.0, show_default=True, help='Target shard size in GB when --pack-shards is used.')
 
 def encode(
     model_url: str,
@@ -457,6 +464,8 @@ def encode(
     max_images: Optional[int],
     gpus: int,
     batch_size: int,
+    pack_shards: bool,
+    shard_size_gb: float,
 ):
     """Encode pixel data to VAE latents.
     
@@ -529,6 +538,20 @@ def encode(
     metadata = {'labels': labels if all(x is not None for x in labels) else None}
     save_bytes(os.path.join(archive_root_dir, 'dataset.json'), json.dumps(metadata))
     close_dest()
+
+    # Optional shard packing (only if dest is a folder; if zip, user should unzip first or re-run packing manually)
+    if pack_shards:
+        if file_ext(dest) == 'zip':
+            print('[encode] --pack-shards ignored because destination is a .zip. Unzip and run pack manually if needed.')
+        else:
+            try:
+                from preprocessing.dataset_tools import pack_npy_directory as _pack
+            except Exception:
+                from dataset_tools import pack_npy_directory as _pack  # fallback if run from within package
+            packed_dir = os.path.join(dest, 'vae_packed')
+            print(f'[encode] Packing encoded VAE latents into shards at {packed_dir} (target {shard_size_gb} GB)...')
+            _pack(dest, packed_dir, pattern='mean-std-', shard_size_gb=shard_size_gb)
+            print('[encode] Packing complete.')
 
 #----------------------------------------------------------------------------
 # ===== ADD BELOW TO YOUR EXISTING DATASET PREPARATION SCRIPT =====
@@ -642,16 +665,13 @@ def _dinov3_worker_loop(
             return PIL.Image.open(f).convert('RGB')
 
 
-    def _write_item(idx: int, arr_cls: np.ndarray, arr_patches: np.ndarray, label: Optional[int]):
+    def _write_item(idx: int, arr_hidden_states: np.ndarray, label: Optional[int]):
         idx_str = f'{idx:08d}'
-        rel_cls     = f'{idx_str[:5]}/img-dinov3-{idx_str}_cls.npy'
-        rel_patches = f'{idx_str[:5]}/img-dinov3-{idx_str}_patches.npy'
-        full_cls     = os.path.join(write_root, rel_cls)
-        full_patches = os.path.join(write_root, rel_patches)
-        _atomic_save_npy(full_cls,     arr_cls)
-        _atomic_save_npy(full_patches, arr_patches)
-        # Return the CLS path in labels; loader can derive the patches path.
-        return (idx, rel_cls, label)
+        rel_hidden = f'{idx_str[:5]}/img-dinov3-{idx_str}_hidden.npy'
+        full_hidden = os.path.join(write_root, rel_hidden)
+        _atomic_save_npy(full_hidden, arr_hidden_states)
+        # Return the hidden states path in labels
+        return (idx, rel_hidden, label)
 
     try:
         torch.cuda.set_device(gpu_id)
@@ -672,7 +692,6 @@ def _dinov3_worker_loop(
             _ = model(pixel_values=torch.zeros(1,3,16,16, device=device, dtype=model.dtype))
         torch.backends.cudnn.benchmark = True
 
-        num_register_tokens = getattr(getattr(model,"config",object()), "num_register_tokens", 4)
         out_dtype = np.float16 if dtype_str in ('float16','bfloat16') else np.float32
 
         decode_pool = ThreadPoolExecutor(max_workers=max(1, decode_threads))
@@ -734,12 +753,12 @@ def _dinov3_worker_loop(
             B = hidden_cpu.shape[0]
             for b in range(B):
                 h = hidden_cpu[b]             # [1+R+N, D]
-                cls = h[0].contiguous().numpy()            # view
-                patches = h[1 + int(num_register_tokens):].contiguous().numpy()
-                if patches.dtype != np.float16 and out_dtype == np.float16:
-                    patches = patches.astype(np.float16, copy=False)
-                    cls = cls.astype(np.float16, copy=False)
-                fut = serial_pool.submit(_write_item, indices[b], cls, patches, labels_local[b])
+                # Store the entire hidden states array
+                if h.dtype != np.float16 and out_dtype == np.float16:
+                    h = h.contiguous().numpy().astype(np.float16, copy=False)
+                else:
+                    h = h.contiguous().numpy()
+                fut = serial_pool.submit(_write_item, indices[b], h, labels_local[b])
                 pending_serial.append(fut)
 
             _flush_serial()
@@ -767,6 +786,8 @@ def _dinov3_worker_loop(
 @click.option('--dtype',             type=click.Choice(['float32','float16','bfloat16']), default='float16', show_default=True)
 @click.option('--decode-threads',    type=int, default=4, show_default=True)
 @click.option('--serialize-threads', type=int, default=2, show_default=True)
+@click.option('--pack-shards', is_flag=True, default=False, help='After encoding, pack individual *_hidden.npy files into contiguous shards (creates dinov3_packed).')
+@click.option('--shard-size-gb', type=float, default=4.0, show_default=True, help='Target shard size in GB when --pack-shards is used.')
 def encode_dinov3(
     model_name: str,
     source: str,
@@ -777,9 +798,11 @@ def encode_dinov3(
     dtype: str,
     decode_threads: int,
     serialize_threads: int,
+    pack_shards: bool,
+    shard_size_gb: float,
 ):
     """
-    DINOv3 precompute with correct CLS/patches, forced no-resize, and worker-local I/O.
+    DINOv3 precompute storing full hidden states, forced no-resize, and worker-local I/O.
     Workers write artifacts directly to disk; main process only assembles labels and (optionally) zips once.
     """
     PIL.Image.init()
@@ -874,8 +897,299 @@ def encode_dinov3(
 
     finalize_zip()
     print(f"[encode-dinov3] Done. Encoded {images_done}/{images_dispatched} images.")
+
+    # Optional shard packing (only if dest is a folder; if zip, user should unzip first or re-run packing manually)
+    if pack_shards:
+        if file_ext(dest) == 'zip':
+            print('[encode-dinov3] --pack-shards ignored because destination is a .zip. Unzip and run pack manually if needed.')
+        else:
+            try:
+                from preprocessing.dataset_tools import pack_npy_directory as _pack
+            except Exception:
+                from dataset_tools import pack_npy_directory as _pack
+            packed_dir = os.path.join(dest, 'dinov3_packed')
+            print(f'[encode-dinov3] Packing DINOv3 hidden states into shards at {packed_dir} (target {shard_size_gb} GB)...')
+            _pack(dest, packed_dir, pattern='_hidden.npy', shard_size_gb=shard_size_gb)
+            print('[encode-dinov3] Packing complete.')
 # ===== END ADD =====
 
+
+
+
+# ================= Additional optimization: pack existing per-image npy into shards =================
+# Lightweight utility (CLI separate from click group to avoid large refactor in truncated file version).
+def pack_npy_directory(src_dir: str, dest_dir: str, pattern: str = '_hidden.npy', shard_size_gb: float = 4.0):
+    """Pack many fixed-shape .npy arrays into large binary shards with an index.json.
+
+    src_dir: directory containing .npy files (e.g. DINO embeddings or VAE latents)
+    dest_dir: output directory (created if missing)
+    pattern: substring filter for file selection
+    shard_size_gb: target maximum shard size
+    """
+    import numpy as _np, json as _json, os as _os, math as _math, glob as _glob
+    _os.makedirs(dest_dir, exist_ok=True)
+    files = sorted([f for f in _glob.glob(_os.path.join(src_dir, '**', '*.npy'), recursive=True) if pattern in _os.path.basename(f)])
+    assert files, f'No files found matching pattern {pattern}'
+    # Probe first file for shape/dtype
+    sample = _np.load(files[0], mmap_mode='r')
+    shape = sample.shape
+    dtype = sample.dtype
+    rec_size = sample.nbytes
+    max_shard_bytes = int(shard_size_gb * (1024**3))
+    per_shard = max(1, max_shard_bytes // rec_size)
+    shards = []
+    cur_data = bytearray()
+    shard_index = 0
+    shard_count = 0
+    shard_meta = []
+    labels = []  # attempt to load sibling dataset.json if present
+    # Try labels
+    label_file = _os.path.join(src_dir, 'dataset.json')
+    label_map = None
+    if _os.path.isfile(label_file):
+        try:
+            with open(label_file, 'r') as fh:
+                ld = _json.load(fh)['labels']
+            if ld is not None:
+                label_map = dict(ld)
+        except Exception:
+            pass
+    def flush():
+        nonlocal cur_data, shard_index, shard_count
+        if not cur_data:
+            return
+        fname = f'shard_{shard_index:05d}.bin'
+        with open(_os.path.join(dest_dir, fname), 'wb') as fw:
+            fw.write(cur_data)
+        shard_meta.append({'file': fname, 'samples': shard_count})
+        shard_index += 1
+        shard_count = 0
+        cur_data = bytearray()
+    for i, f in enumerate(files):
+        arr = _np.load(f, mmap_mode='r')
+        assert arr.shape == shape and arr.dtype == dtype, 'Inconsistent array shape/dtype'
+        cur_data.extend(arr.tobytes(order='C'))
+        shard_count += 1
+        # gather label if possible
+        if label_map is not None:
+            # Normalize path relative to src_dir like existing dataset.json style
+            rel = _os.path.relpath(f, src_dir).replace('\\','/')
+            labels.append(label_map.get(rel, -1))
+        else:
+            labels.append(-1)
+        if shard_count >= per_shard or len(cur_data) >= max_shard_bytes:
+            flush()
+    flush()
+    index = {
+        'dtype': str(dtype),
+        'shape': list(shape),
+        'record_size': rec_size,
+        'shards': shard_meta,
+        'labels': labels,
+    }
+    with open(_os.path.join(dest_dir, 'index.json'), 'w') as fh:
+        _json.dump(index, fh)
+    print(f"Packed {len(files)} records into {len(shard_meta)} shards at {dest_dir}")
+
+
+# ================= Parallel & Resumable Shard Packer =================
+def pack_npy_directory_parallel(
+    src_dir: str,
+    dest_dir: str,
+    pattern: str = '_hidden.npy',
+    shard_size_gb: float = 4.0,
+    workers: int = 8,
+    resume: bool = False,
+):
+    """Pack many fixed-shape .npy arrays into large binary shards (parallel + resumable).
+
+    Strategy:
+      * Enumerate & sort matching files.
+      * Determine record_size from first file (shape/dtype must match for all).
+      * Compute target samples per shard from shard_size_gb.
+      * Split file list into contiguous shard segments. Each worker processes shard segments assigned to it.
+      * Each shard is written sequentially to avoid random writes; within shard we preserve order.
+      * Resume: if dest_dir contains existing shard_XXXXX.bin files, we infer their sample counts from file sizes and skip those files.
+
+    Produces dest_dir/index.json with same schema as original packer.
+    """
+    import numpy as _np, json as _json, os as _os, glob as _glob, math as _math, multiprocessing as _mp
+    from functools import partial as _partial
+
+    _os.makedirs(dest_dir, exist_ok=True)
+    all_files = sorted([f for f in _glob.glob(_os.path.join(src_dir, '**', '*.npy'), recursive=True) if pattern in _os.path.basename(f)])
+    if not all_files:
+        raise FileNotFoundError(f'No npy files matching pattern {pattern} in {src_dir}')
+
+    # Probe first non-empty file
+    probe = _np.load(all_files[0], mmap_mode='r')
+    shape = probe.shape; dtype = probe.dtype; rec_size = probe.nbytes
+    max_shard_bytes = int(shard_size_gb * (1024**3))
+    per_shard = max(1, max_shard_bytes // rec_size)
+
+    # Resume detection
+    existing_shards = sorted([f for f in os.listdir(dest_dir) if f.startswith('shard_') and f.endswith('.bin')]) if resume else []
+    shard_meta = []
+    labels = []
+    processed_files = 0
+    if existing_shards:
+        print(f'[pack-par] Resume enabled: found {len(existing_shards)} existing shard files, validating...')
+        for shf in existing_shards:
+            full = os.path.join(dest_dir, shf)
+            size = os.path.getsize(full)
+            if size % rec_size != 0:
+                raise RuntimeError(f'Existing shard {shf} size {size} not divisible by record_size {rec_size}')
+            samples = size // rec_size
+            shard_idx = int(shf.split('_')[1].split('.')[0])
+            shard_meta.append({'file': shf, 'samples': samples})
+            processed_files += samples
+        shard_meta.sort(key=lambda x: x['file'])
+        print(f'[pack-par] Will skip first {processed_files} files already packed.')
+
+    remaining_files = all_files[processed_files:]
+    if not remaining_files:
+        print('[pack-par] Nothing to do; all files already packed.')
+        # Attempt to load labels from existing index; otherwise fill -1
+        index_path = os.path.join(dest_dir, 'index.json')
+        if os.path.isfile(index_path):
+            return
+    total_files = len(all_files)
+
+    # Labels
+    label_file = os.path.join(src_dir, 'dataset.json')
+    label_map = None
+    if os.path.isfile(label_file):
+        try:
+            with open(label_file,'r') as fh:
+                ld = _json.load(fh)['labels']
+            if ld is not None:
+                label_map = dict(ld)
+        except Exception:
+            pass
+
+    # Pre-size labels list (lazy fill with -1 then fill for new part only) to avoid large concatenations
+    # We only assemble labels for new part then if existing index.json exists we merge; else we create full list.
+    existing_labels = None
+    existing_index_path = os.path.join(dest_dir, 'index.json')
+    if resume and os.path.isfile(existing_index_path):
+        try:
+            with open(existing_index_path,'r') as fh:
+                existing_index = _json.load(fh)
+            existing_labels = existing_index.get('labels')
+        except Exception:
+            existing_labels = None
+
+    def _collect_labels(files_slice):
+        out = []
+        if label_map is None:
+            return [-1]*len(files_slice)
+        for f in files_slice:
+            rel = os.path.relpath(f, src_dir).replace('\\','/')
+            out.append(label_map.get(rel, -1))
+        return out
+
+    # Build shard plan for remaining files
+    rem_total = len(remaining_files)
+    if rem_total == 0:
+        pass
+    else:
+        num_new_shards = _math.ceil(rem_total / per_shard)
+        next_shard_id = len(shard_meta)
+        shard_jobs = []  # list of job dicts
+        for i in range(num_new_shards):
+            start = i * per_shard
+            end = min(rem_total, (i + 1) * per_shard)
+            shard_jobs.append({
+                'shard_id': next_shard_id + i,
+                'files': remaining_files[start:end],
+            })
+
+        # Prepare static payload for workers
+        worker_args = []
+        for job in shard_jobs:
+            worker_args.append((job['shard_id'], job['files'], dest_dir, shape, str(dtype), rec_size))
+
+        print(f'[pack-par] Packing {rem_total} remaining records using {workers} workers into ~{num_new_shards} shards (target {per_shard} rec/shard)...')
+        # Import top-level worker (defined below) dynamically to avoid circular reference issues
+        _worker = parallel_pack_worker  # self module import
+        with _mp.Pool(processes=workers) as pool:
+            for shard_id, out_name, samples in sorted(pool.imap_unordered(_worker, worker_args), key=lambda x: x[0]):
+                shard_meta.append({'file': out_name, 'samples': samples})
+                # collect labels for this shard
+                labels_part = _collect_labels([f for f in remaining_files if f.endswith(out_name)][:0])  # placeholder (labels gathered separately below)
+        # Because we collected no labels per-file in worker (to minimize IPC), gather labels directly now for remaining files in order
+        if label_map is not None:
+            for f in remaining_files:
+                rel = os.path.relpath(f, src_dir).replace('\\','/')
+                labels.append(label_map.get(rel, -1))
+        else:
+            labels.extend([-1]*rem_total)
+
+    # Combine labels (existing + new)
+    if existing_labels is not None:
+        # existing_labels length should equal processed_files; if not warn and rebuild
+        if len(existing_labels) != processed_files:
+            print(f'[pack-par] Warning: existing labels length {len(existing_labels)} != processed files {processed_files}; rebuilding label list with -1 for old part.')
+            full_labels = [-1]*processed_files + labels
+        else:
+            full_labels = existing_labels + labels
+    else:
+        # Need labels for entire dataset. If we processed from scratch processed_files==0
+        if processed_files > 0:
+            # Fill old part with -1 if we don't have them
+            full_labels = [-1]*processed_files + labels
+        else:
+            full_labels = labels
+
+    index = {
+        'dtype': str(dtype),
+        'shape': list(shape),
+        'record_size': rec_size,
+        'shards': shard_meta,
+        'labels': full_labels,
+    }
+    with open(os.path.join(dest_dir, 'index.json'), 'w') as fh:
+        _json.dump(index, fh)
+    print(f"[pack-par] Done. Packed {len(all_files)} records into {len(shard_meta)} shards at {dest_dir}")
+
+
+# Top-level worker function for parallel shard packing (must be picklable)
+def parallel_pack_worker(args):
+    import numpy as _np, os as _os
+    shard_id, files, dest_dir, shape, dtype_str, rec_size = args
+    out_name = f'shard_{shard_id:05d}.bin'
+    out_path = _os.path.join(dest_dir, out_name)
+    if _os.path.exists(out_path):
+        size = _os.path.getsize(out_path)
+        samples = size // rec_size
+        return (shard_id, out_name, samples)
+    dtype = _np.dtype(dtype_str)
+    with open(out_path, 'wb') as fw:
+        for f in files:
+            arr = _np.load(f, mmap_mode='r')
+            if arr.shape != tuple(shape) or arr.dtype != dtype:
+                raise ValueError(f'Shape/dtype mismatch in {f}: {arr.shape}/{arr.dtype} != {shape}/{dtype}')
+            fw.write(arr.tobytes(order='C'))
+    return (shard_id, out_name, len(files))
+
+
+# Register a lightweight CLI command for packing to avoid heavy click group dependency
+@cmdline.command(name='pack')
+@click.option('--src', type=str, required=True, help='Source directory containing per-sample .npy files.')
+@click.option('--dest', type=str, required=True, help='Destination directory for packed shards.')
+@click.option('--pattern', type=str, default='_hidden.npy', show_default=True, help='Substring pattern to select .npy files.')
+@click.option('--shard-size-gb', type=float, default=4.0, show_default=True, help='Target shard size in GB.')
+@click.option('--workers', type=int, default=8, show_default=True, help='Parallel workers (processes).')
+@click.option('--resume', is_flag=True, default=False, help='Resume from existing shards (append remaining).')
+@click.option('--parallel/--no-parallel', default=True, help='Disable parallel mode (fallback to original single-thread pack).')
+def pack_cli(src: str, dest: str, pattern: str, shard_size_gb: float, workers: int, resume: bool, parallel: bool):
+    """Pack per-sample .npy arrays into shards (parallel & resumable)."""
+    if parallel:
+        pack_npy_directory_parallel(src, dest, pattern=pattern, shard_size_gb=shard_size_gb, workers=workers, resume=resume)
+    else:
+        if resume:
+            print('[pack] Resume requested but not supported in non-parallel mode; ignoring.')
+        pack_npy_directory(src, dest, pattern=pattern, shard_size_gb=shard_size_gb)
 
 if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)  # Required for CUDA multiprocessing

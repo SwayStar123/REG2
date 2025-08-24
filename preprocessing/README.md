@@ -17,29 +17,53 @@ then use ```aria2c -x 16 -s 16 "link"``` to download quickly
 After downloading ImageNet, please run the following scripts (please update 256x256 to 512x512 if you want to do experiments on 512x512 resolution);
 
 ```bash
-# Convert raw ImageNet data to a ZIP archive at 256x256 resolution
-python dataset_tools.py convert --source=data/ILSVRC/Data/CLS-LOC/train \
-    --dest=dataset/images --resolution=256x256 --transform=center-crop-dhariwal
-```
+# 1. Convert raw ImageNet data to image folder (256x256) (change to 512x512 if needed)
+python preprocessing/dataset_tools.py convert \
+  --source data/ILSVRC/Data/CLS-LOC/train \
+  --dest   dataset/images \
+  --resolution=256x256 \
+  --transform=center-crop-dhariwal
 
-```bash
-# Convert the pixel data to VAE latents
-python dataset_tools.py encode --source=dataset/images \
-    --dest=dataset/vae-sd
-```
+# 2. Encode images to VAE latents (writes individual .npy files)
+python preprocessing/dataset_tools.py encode \
+  --source dataset/images \
+  --dest   dataset/vae-sd
 
-```
-python3 preprocessing/dataset_tools.py encode-dinov3 \
+# 3. Encode DINOv3 hidden states (writes individual *_hidden.npy files)
+python preprocessing/dataset_tools.py encode-dinov3 \
   --source dataset/images \
   --dest   dataset/dinov3-vit7b16 \
   --model-name facebook/dinov3-vit7b16-pretrain-lvd1689m \
-  --gpus 8 --batch-size 200 --dtype float16 --compress none
+  --gpus 8 --batch-size 200 --dtype float16
+
+# 4. Pack VAE latents into shards (parallel + resumable)
+python preprocessing/dataset_tools.py pack \
+  --src dataset/vae-sd \
+  --dest dataset/vae_packed \
+  --pattern mean-std- \
+  --shard-size-gb 4.0 \
+  --workers 16
+
+# 5. Pack DINO hidden states into shards (parallel + resumable)
+python preprocessing/dataset_tools.py pack \
+  --src dataset/dinov3-vit7b16 \
+  --dest dataset/dinov3_packed \
+  --pattern _hidden.npy \
+  --shard-size-gb 4.0 \
+  --workers 16
+
+# (If packing interrupted, rerun with --resume to continue)
+# python preprocessing/dataset_tools.py pack --src dataset/dinov3-vit7b16 --dest dataset/dinov3_packed --pattern _hidden.npy --resume
+
+# Final directory MUST contain:
+# dataset/vae_packed/index.json + shard_*.bin
+# dataset/dinov3_packed/index.json + shard_*.bin
 ```
 
-compress none is significantly faster, but will take like ~20% more storage iirc
 
+Training now ONLY supports the packed shards (vae_packed & dinov3_packed). Keep the original per-file directories only if you plan to re-pack with different shard sizes. 
 
-Here,`YOUR_DOWNLOAD_PATH` is the directory that you downloaded the dataset, and `TARGET_PATH` is the directory that you will save the preprocessed images and corresponding compressed latent vectors. This directory will be used for your experiment scripts. 
+Here,`YOUR_DOWNLOAD_PATH` is the directory that you downloaded the dataset, and `TARGET_PATH` is the directory that you will save the preprocessed images and corresponding compressed latent vectors. This directory will be used for your experiment scripts.
 
 ## Acknowledgement
 

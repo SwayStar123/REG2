@@ -1,12 +1,11 @@
 
 random_number=$((RANDOM % 100 + 1200))
 NUM_GPUS=8
-STEP="2400000"
-SAVE_PATH="your_path/reg_xlarge_dinov2_base_align_8_cls/linear-dinov2-b-enc8"
-VAE_PATH="your_vae_path/"
+STEP="0400000"
+SAVE_PATH="exps/xl-dinov3-7b-16-clstoks"
 NUM_STEP=250
 MODEL_SIZE='XL'
-CFG_SCALE=2.3
+CFG_SCALE=4.0
 CLS_CFG_SCALE=2.3
 GH=0.85
 
@@ -18,21 +17,21 @@ python -m torch.distributed.launch --master_port=$random_number --nproc_per_node
   --ckpt ${SAVE_PATH}/checkpoints/${STEP}.pt \
   --path-type=linear \
   --encoder-depth=8 \
-  --projector-embed-dims=768 \
+  --projector-embed-dims=4096 \
   --per-proc-batch-size=64 \
   --mode=sde \
   --num-steps=${NUM_STEP} \
   --cfg-scale=${CFG_SCALE} \
   --cls-cfg-scale=${CLS_CFG_SCALE} \
   --guidance-high=${GH} \
-  --sample-dir ${SAVE_PATH}/checkpoints \
-  --cls=768
+  --sample-dir ${SAVE_PATH}/eval_samples \
+  --cls=4096
 
 
 python ./evaluations/evaluator.py \
-    --ref_batch your_path/VIRTUAL_imagenet256_labeled.npz \
-    --sample_batch ${SAVE_PATH}/checkpoints/SiT-${MODEL_SIZE}-2-${STEP}-size-256-vae-ema-cfg-${CFG_SCALE}-seed-0-sde-${GH}-${CLS_CFG_SCALE}.npz \
-    --save_path ${SAVE_PATH}/checkpoints \
+    --ref_batch /home/ubuntu/stuff/REG2/VIRTUAL_imagenet256_labeled.npz \
+    --sample_batch ${SAVE_PATH}/eval_samples/SiT-${MODEL_SIZE}-2-${STEP}-size-256-vae-ema-cfg-${CFG_SCALE}-seed-0-sde-${GH}-${CLS_CFG_SCALE}.npz \
+    --save_path ${SAVE_PATH}/eval_samples \
     --cfg_cond 1 \
     --step ${STEP} \
     --num_steps ${NUM_STEP} \

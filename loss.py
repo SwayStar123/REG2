@@ -75,7 +75,7 @@ class SILoss:
         alpha_t, sigma_t, d_alpha_t, d_sigma_t = self.interpolant(time_input)
 
         model_input = alpha_t * images + sigma_t * noises
-        cls_input = alpha_t.squeeze(-1).squeeze(-1) * cls_token + sigma_t.squeeze(-1).squeeze(-1) * noises_cls
+        cls_input = alpha_t.squeeze(-1) * cls_token + sigma_t.squeeze(-1) * noises_cls
         if self.prediction == 'v':
             model_target = d_alpha_t * images + d_sigma_t * noises
             cls_target = d_alpha_t * cls_token + d_sigma_t * noises_cls
@@ -94,9 +94,28 @@ class SILoss:
         bsz = zs[0].shape[0]
         for i, (z, z_tilde) in enumerate(zip(zs, zs_tilde)):
             for j, (z_j, z_tilde_j) in enumerate(zip(z, z_tilde)):
-                z_tilde_j = torch.nn.functional.normalize(z_tilde_j, dim=-1) 
-                z_j = torch.nn.functional.normalize(z_j, dim=-1)
-                proj_loss += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
+                # cosine with upcasting
+                z_tilde_j_fp32 = z_tilde_j.float()
+                z_j_fp32 = z_j.float()
+
+                # Save first 5 values before normalization (flatten to 1D)
+                # if i == 0 and j == 0:
+                    # print("z_j pre-norm:", z_j_fp32.flatten()[:5].detach().cpu())
+                    # print("z_tilde_j pre-norm:", z_tilde_j_fp32.flatten()[:5].detach().cpu())
+
+                z_tilde_j_norm = torch.nn.functional.normalize(z_tilde_j_fp32, dim=-1)
+                z_j_norm = torch.nn.functional.normalize(z_j_fp32, dim=-1)
+
+                # Cast back to original dtype
+                z_tilde_j_norm = z_tilde_j_norm.to(z_tilde_j.dtype)
+                z_j_norm = z_j_norm.to(z_j.dtype)
+
+                # Print first 5 values after normalization
+                # if i == 0 and j == 0:
+                #     print("z_j post-norm:", z_j_norm.flatten()[:5].detach().cpu())
+                #     print("z_tilde_j post-norm:", z_tilde_j_norm.flatten()[:5].detach().cpu())
+
+                proj_loss += mean_flat(-(z_j_norm * z_tilde_j_norm).sum(dim=-1))
         proj_loss /= (len(zs) * bsz)
 
         return denoising_loss, proj_loss, time_input, noises, denoising_loss_cls

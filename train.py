@@ -23,7 +23,7 @@ from models.sit import SiT_models
 from samplers import euler_maruyama_sampler
 from loss import SILoss
 
-from dataset import CustomDataset
+from dataset_old import CustomDataset
 # import wandb_utils
 import wandb
 from diffusers.models import AutoencoderKL
@@ -133,7 +133,9 @@ def main(args):
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
-        kwargs_handlers=[DistributedDataParallelKwargs()]
+        kwargs_handlers=[DistributedDataParallelKwargs(
+            # find_unused_parameters=True
+        )]
     )
 
     if accelerator.is_main_process:
@@ -162,11 +164,14 @@ def main(args):
     # ------------------------------------------------------------------
     # Dataset with pre-computed DINOv3 tokens (no online encoding)
     # ------------------------------------------------------------------
-    train_dataset = CustomDataset(args.data_dir, load_dinov3=True, dinov3_subdir="dinov3-vit7b16")
+    train_dataset = CustomDataset(
+        args.data_dir,
+        # cls_tokens=args.cls_tokens,
+    )
     # Infer token embedding dim from a single sample
     tmp = train_dataset[0]
-    if len(tmp) == 5:
-        _raw_img, _vae_latents, _lbl, tmp_tokens, _tmp_cls = tmp
+    if len(tmp) == 4:
+        _vae_latents, _lbl, tmp_tokens, _tmp_cls = tmp
     else:
         raise RuntimeError("Dataset must be initialized with load_dinov3=True returning 5 elements.")
     token_dim = tmp_tokens.shape[-1]
@@ -179,10 +184,12 @@ def main(args):
         use_cfg = (args.cfg_prob > 0),
         z_dims = z_dims,
         encoder_depth=args.encoder_depth,
+        cls_tokens=args.cls_tokens,
         **block_kwargs
     )
 
     model = model.to(device)
+    # model = torch.compile(model, mode="reduce-overhead")
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
     
@@ -279,8 +286,8 @@ def main(args):
     # Labels to condition the model with (feel free to change):
     sample_batch_size = 64 // accelerator.num_processes
     sample_batch = next(iter(train_dataloader))
-    if len(sample_batch) == 5:
-        gt_raw_images, gt_xs, _labels, _tokens, _cls = sample_batch
+    if len(sample_batch) == 4:
+        gt_xs, _labels, _tokens, _cls = sample_batch
     elif len(sample_batch) == 3:
         raise RuntimeError("load_dinov3 must be True; received 3-element batch.")
     else:
@@ -293,8 +300,8 @@ def main(args):
     n = ys.size(0)
     xT = torch.randn((n, 4, latent_size, latent_size), device=device)
     # cls latents (dimension inferred from token_dim / cls token size)
-    cls_latent_dim = token_dim
-    cls_z = torch.randn(n, cls_latent_dim, device=device)
+    cls_latent_dim = token_dim // args.cls_tokens  # split the dimension
+    cls_z = torch.randn(n, args.cls_tokens, cls_latent_dim, device=device)
 
     # sampling directory & VAE placeholder
     if accelerator.is_main_process:
@@ -315,11 +322,18 @@ def main(args):
             data_time = iter_start_wall - prev_iter_end
             if len(batch) == 3:
                 raise RuntimeError("Dataset must be called with load_dinov3=True returning tokens.")
-            raw_image, x, y, dinov3_tokens, dinov3_cls = batch
+            x, y, dinov3_tokens, dinov3_cls = batch
             x = x.squeeze(1).to(device, non_blocking=True)  # VAE latents (mean+std packed)
+           
             y = y.to(device, non_blocking=True)
             dinov3_tokens = dinov3_tokens.to(device, non_blocking=True)  # [B, 1+N, D]
             dinov3_cls = dinov3_cls.to(device, non_blocking=True)        # [B, D]
+            # dinov3_cls = torch.zeros((x.shape[0], 1, 4096)).to(device)
+            # print(dinov3_cls.shape)
+            # exit()
+
+            # print(dinov3_cls.shape, dinov3_tokens.shape)
+            # exit()
 
             if args.legacy:
                 drop_ids = torch.rand(y.shape[0], device=y.device) < args.cfg_prob
@@ -331,7 +345,7 @@ def main(args):
                 x = sample_posterior(x, latents_scale=latents_scale, latents_bias=latents_bias)
 
             cls_token = dinov3_cls
-            zs = [torch.cat([cls_token.unsqueeze(1), dinov3_tokens], dim=1)]
+            zs = [dinov3_tokens]
 
             # Micro-step accumulators for gradient accumulation
             if 'acc_forward_time' not in locals():
@@ -350,9 +364,9 @@ def main(args):
                     time_input=None, noises=None
                 )
                 loss_mean = loss1.mean()
-                loss_mean_cls = loss2.mean() * args.cls
-                proj_loss_mean = proj_loss1.mean() * args.proj_coeff
-                loss = loss_mean + proj_loss_mean + loss_mean_cls
+                loss_mean_cls = loss2.mean() 
+                proj_loss_mean = proj_loss1.mean() 
+                loss = loss_mean + (proj_loss_mean * args.proj_coeff) + (loss_mean_cls * args.cls)
                 forward_end = time.perf_counter()
                 acc_forward_time += (forward_end - forward_start)
 
@@ -482,7 +496,7 @@ def main(args):
             # logging.info(f"Step: {global_step}, Training Logs: {log_message}")
 
             if logs:
-                progress_bar.set_postfix(**{k: v for k, v in logs.items() if k.startswith('loss') or k.startswith('time_')})
+                progress_bar.set_postfix(**{k: v for k, v in logs.items() if "loss" in k})
                 accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
@@ -558,6 +572,7 @@ def parse_args(input_args=None):
     parser.add_argument("--guidance-low", type=float, default=0.0)
     parser.add_argument("--guidance-high", type=float, default=1.0)
     parser.add_argument("--num-sample-steps", type=int, default=50, help="Diffusion sampling steps for in-training sampling.")
+    parser.add_argument("--cls-tokens", type=int, default=16, help="Number of tokens to split the class token into.")
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="mse", help="Which Stable Diffusion VAE variant to use for decoding samples.")
     if input_args is not None:
         args = parser.parse_args(input_args)

@@ -22,7 +22,7 @@ import numpy as np
 import math
 import argparse
 from samplers import euler_maruyama_sampler
-from utils import load_legacy_checkpoints, download_model
+# from utils import load_legacy_checkpoints, download_model
 
 
 def create_npz_from_sample_folder(sample_dir, num=50_000):
@@ -68,6 +68,7 @@ def main(args):
         use_cfg = True,
         z_dims = [int(z_dim) for z_dim in args.projector_embed_dims.split(',')],
         encoder_depth=args.encoder_depth,
+        cls_tokens=args.cls_tokens,
         **block_kwargs,
     ).to(device)
     # Auto-download a pre-trained model or load a custom SiT checkpoint from train.py:
@@ -82,7 +83,7 @@ def main(args):
         assert int(args.projector_embed_dims.split(',')[0]) == 768
         state_dict = download_model('last.pt')
     else:
-        state_dict = torch.load(ckpt_path, map_location=f'cuda:{device}')['ema']
+        state_dict = torch.load(ckpt_path, map_location=f'cuda:{device}', weights_only=False)['ema']
 
     if args.legacy:
         state_dict = load_legacy_checkpoints(
@@ -128,7 +129,7 @@ def main(args):
         # Sample inputs:
         z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
         y = torch.randint(0, args.num_classes, (n,), device=device)
-        cls_z = torch.randn(n, args.cls, device=device)
+        cls_z = torch.randn(n, args.cls_tokens, args.cls // args.cls_tokens, device=device)
 
         # Sample images:
         sampling_kwargs = dict(
@@ -218,7 +219,8 @@ if __name__ == "__main__":
     parser.add_argument("--guidance-low", type=float, default=0.)
     parser.add_argument("--guidance-high", type=float, default=1.)
     parser.add_argument('--local-rank', default=-1, type=int)
-    parser.add_argument('--cls', default=768, type=int)
+    parser.add_argument('--cls', default=4096, type=int)
+    parser.add_argument("--cls-tokens", type=int, default=16, help="Number of tokens to split the class token into.")
     # will be deprecated
     parser.add_argument("--legacy", action=argparse.BooleanOptionalAction, default=False) # only for ode
 
