@@ -166,7 +166,7 @@ def main(args):
     # ------------------------------------------------------------------
     train_dataset = CustomDataset(
         args.data_dir,
-        # cls_tokens=args.cls_tokens,
+        cls_tokens=args.cls_tokens,
     )
     # Infer token embedding dim from a single sample
     tmp = train_dataset[0]
@@ -175,6 +175,7 @@ def main(args):
     else:
         raise RuntimeError("Dataset must be initialized with load_dinov3=True returning 5 elements.")
     token_dim = tmp_tokens.shape[-1]
+    print(f"tmp_tokens shape: {tmp_tokens.shape}")
     z_dims = [token_dim]
     encoders = []  # kept for SILoss interface (unused)
     block_kwargs = {"fused_attn": args.fused_attn, "qk_norm": args.qk_norm}
@@ -253,7 +254,7 @@ def main(args):
         ckpt_name = str(args.resume_step).zfill(7) +'.pt'
         ckpt = torch.load(
             f'{os.path.join(args.output_dir, args.exp_name)}/checkpoints/{ckpt_name}',
-            map_location='cpu',
+            map_location='cpu', weights_only=False,
             )
         model.load_state_dict(ckpt['model'])
         ema.load_state_dict(ckpt['ema'])
@@ -457,7 +458,7 @@ def main(args):
                                 Image.fromarray(grid).save(f"{sample_dir}/samples_step_{global_step}.png")
                                 logger.info(f"Saved samples at step {global_step}")
                                 if global_step % 20000 == 0:
-                                    accelerator.log({"samples": wandb.Image(grid)}, step=global_step)
+                                    accelerator.log({"samples": wandb.Image(grid, file_type="jpg")}, step=global_step)
                         except Exception as e:
                             if accelerator.is_main_process:
                                 logger.warning(f"Sampling failed at step {global_step}: {e}")

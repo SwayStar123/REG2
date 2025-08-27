@@ -16,7 +16,9 @@ accelerate launch --multi_gpu --num_processes $NUM_GPUS train.py \
     --exp-name="xl-dinov3-7b-16-clstoks" \
     --batch-size=256 \
     --data-dir="dataset" \
-    --cls=0.03
+    --cls=0.03 \
+    --cls-tokens=16 \
+    --resume-step=670000
 
 
     #Dataset Path

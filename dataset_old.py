@@ -32,6 +32,7 @@ class CustomDataset(Dataset):
         data_dir: str,
         load_dinov3: bool = True,
         dinov3_subdir: Optional[str] = "dinov3-vit7b16",  # folder name or absolute path
+        cls_tokens = 16,
     ):
         PIL.Image.init()
         supported_img_ext = set(PIL.Image.EXTENSION.keys()) | {'.npy'}  # allow .png/.jpg/... or .npy stubs
@@ -39,6 +40,7 @@ class CustomDataset(Dataset):
         self.images_dir = os.path.join(data_dir, 'images')
         self.features_dir = os.path.join(data_dir, 'vae-sd')
 
+        self.cls_tokens = cls_tokens
         self.load_dinov3 = load_dinov3
         self.dinov3_dir = None
         if load_dinov3:
@@ -116,10 +118,10 @@ class CustomDataset(Dataset):
 
         dino_hidden = np.load(dino_hidden_path)
         dino_hidden = torch.from_numpy(dino_hidden).to(torch.float32)
-        dino_patches = dino_hidden[1 + 4:, :]
+        dino_patches = dino_hidden[1+4:, :]
         dino_cls = dino_hidden[0:1, :]
 
-        dino_cls = dino_cls.view(16, -1)
+        dino_cls = dino_cls.view(self.cls_tokens, -1)
 
         # torchify
         return (

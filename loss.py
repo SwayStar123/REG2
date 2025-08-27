@@ -88,7 +88,9 @@ class SILoss:
         #denoising_loss
         denoising_loss = mean_flat((model_output - model_target) ** 2)
         denoising_loss_cls = mean_flat((cls_output - cls_target) ** 2)
-
+        # denoising_loss = torch.log(F.mse_loss(model_target, model_output, reduction="none")+1e-7).mean()
+        # denoising_loss_cls = torch.log(F.mse_loss(cls_target, cls_output, reduction="none")+1e-7).mean()
+        
         # projection loss
         proj_loss = 0.
         bsz = zs[0].shape[0]

@@ -718,8 +718,8 @@ def _dinov3_worker_loop(
                 out_queue.put(('batch', gpu_id, ready[i:i+CHUNK]))
 
     try:
-        DO_RESIZE = False
-        DO_CENTER_CROP = False
+        DO_RESIZE = True
+        DO_CENTER_CROP = True
 
         while True:
             batch = in_queue.get()

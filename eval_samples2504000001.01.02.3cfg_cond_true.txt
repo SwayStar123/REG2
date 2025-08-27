@@ -1,0 +1,7 @@
+Inception Score: 93.37303924560547
+FID: 16.738101929953757
+sFID: 7.045061680216577
+Precision: 0.63322
+Recall: 0.6192
+
+Dino v2 cls split into 16 tokens

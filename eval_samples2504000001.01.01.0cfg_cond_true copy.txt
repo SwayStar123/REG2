@@ -1,0 +1,7 @@
+Inception Score: 93.47992706298828
+FID: 16.220150381278245
+sFID: 7.141821914500724
+Precision: 0.6398
+Recall: 0.6266
+
+b/2 with dinov2-base 4 cls tok split
